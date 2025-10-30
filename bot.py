@@ -52,12 +52,24 @@ async def forward_handler(event):
         if not source or not targets:
             continue
 
+        # Only process messages from the source
         if str(event.chat_id) == str(source) or getattr(event.chat, 'username', None) == source.replace("@", ""):
             for target in targets:
                 try:
-                    await client.send_message(target, event.message)
+                    if event.message.fwd_from:
+                        # Already forwarded → preserve forward
+                        await client.forward_messages(
+                            entity=target,
+                            messages=event.message,
+                            from_peer=event.chat_id
+                        )
+                        print(f"✅ Forwarded (as forwarded) to {target}")
+                    else:
+                        # Normal message → send normally
+                        await client.send_message(target, event.message)
+                        print(f"✅ Forwarded (normal) to {target}")
+
                     delay = random.uniform(1, 3) + (len(targets) * 0.3)
-                    print(f"✅ Forwarded to {target}. Waiting {delay:.2f}s...")
                     await asyncio.sleep(delay)
                 except Exception as e:
                     print(f"❌ Failed to forward to {target}: {e}")
@@ -172,7 +184,7 @@ def run_web():
     app.run(host="0.0.0.0", port=port)
 
 # -----------------------------
-# MAIN ENTRY (Fixed)
+# MAIN ENTRY
 # -----------------------------
 async def main():
     await client.start(bot_token=BOT_TOKEN)
@@ -180,8 +192,10 @@ async def main():
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
-    # ✅ Start the web server first so Render detects it immediately
+    # Start Flask first
     threading.Thread(target=run_web, daemon=True).start()
+    import time
+    time.sleep(1)  # ensure web server is ready
 
-    # ✅ Then start the Telegram bot
+    # Start Telegram bot
     asyncio.run(main())
