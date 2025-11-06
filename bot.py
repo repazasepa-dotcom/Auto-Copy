@@ -1,39 +1,46 @@
 #!/usr/bin/env python3
-import asyncio
-import json
-import os
-import random
-import threading
+import asyncio, os, random, threading, json
 from telethon import TelegramClient, events, Button
 from flask import Flask
+import requests
 
 # -----------------------------
-# ENVIRONMENT VARIABLES
+# ENV VARS
 # -----------------------------
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = 8150987682
+
+UP_URL = os.getenv("UPSTASH_REDIS_REST_URL")
+UP_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
+
 SESSION_NAME = "/tmp/forward_session"
-CONFIG_FILE = "forward_config.json"
 
 # -----------------------------
-# CONFIG HANDLERS
+# REDIS HELPERS
 # -----------------------------
-def load_config():
-    if not os.path.exists(CONFIG_FILE):
-        save_config({})
+def redis_get(key):
+    r = requests.get(f"{UP_URL}/get/{key}", headers={"Authorization": f"Bearer {UP_TOKEN}"})
+    try:
+        return json.loads(r.json().get("result", "{}"))
+    except:
         return {}
-    with open(CONFIG_FILE, "r") as f:
-        try:
-            return json.load(f)
-        except json.JSONDecodeError:
-            save_config({})
-            return {}
 
-def save_config(config):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(config, f, indent=2)
+def redis_set(key, value):
+    requests.post(
+        f"{UP_URL}/set/{key}",
+        headers={"Authorization": f"Bearer {UP_TOKEN}"},
+        json=value
+    )
+
+CONFIG_KEY = "forward_bot_config"
+
+def load_config():
+    return redis_get(CONFIG_KEY)
+
+def save_config(cfg):
+    redis_set(CONFIG_KEY, cfg)
 
 # -----------------------------
 # TELETHON CLIENT
@@ -43,159 +50,180 @@ client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 # -----------------------------
 # MESSAGE FORWARDING
 # -----------------------------
-@client.on(events.NewMessage)
+@client.on(events.NewMessage(incoming=True))
 async def forward_handler(event):
+    if event.is_private: return
+
     config = load_config()
     for user_id, user_conf in config.items():
         source = user_conf.get("source")
-        targets = user_conf.get("targets", [])
-        if not source or not targets:
-            continue
+        tgts = user_conf.get("targets", [])
 
-        # Only process messages from the source
+        if not source or not tgts: continue
+
         if str(event.chat_id) == str(source) or getattr(event.chat, 'username', None) == source.replace("@", ""):
-            for target in targets:
+            for t in tgts:
                 try:
                     if event.message.fwd_from:
-                        # Already forwarded → preserve forward
-                        await client.forward_messages(
-                            entity=target,
-                            messages=event.message,
-                            from_peer=event.chat_id
-                        )
-                        print(f"✅ Forwarded (as forwarded) to {target}")
+                        await client.forward_messages(t, event.message, from_peer=event.chat_id)
                     else:
-                        # Normal message → send normally
-                        await client.send_message(target, event.message)
-                        print(f"✅ Forwarded (normal) to {target}")
+                        await client.send_message(t, event.message)
 
-                    delay = random.uniform(1, 3) + (len(targets) * 0.3)
-                    await asyncio.sleep(delay)
-                except Exception as e:
-                    print(f"❌ Failed to forward to {target}: {e}")
+                    await asyncio.sleep(random.uniform(1,3) + len(tgts)*0.3)
+                except:
                     await asyncio.sleep(2)
 
 # -----------------------------
-# COMMANDS
+# START COMMAND
 # -----------------------------
 @client.on(events.NewMessage(pattern="/start"))
-async def start_handler(event):
-    user_id = event.sender_id
-    config = load_config()
+async def start(event):
+    uid = event.sender_id
+    cfg = load_config()
+    if str(uid) not in cfg:
+        cfg[str(uid)] = {"source": None, "targets": []}
+        save_config(cfg)
 
-    if user_id == ADMIN_ID:
-        buttons = [
+    if uid == ADMIN_ID:
+        btns = [
             [Button.inline("📡 Set Source", b"set_source")],
             [Button.inline("➕ Add Target", b"add_target")],
+            [Button.inline("❌ Remove Source", b"remove_source")],
+            [Button.inline("🗑 Remove Target", b"remove_target")],
             [Button.inline("📋 View Channels", b"view")],
             [Button.inline("📢 Broadcast", b"broadcast")],
             [Button.inline("📊 Stats", b"stats")],
         ]
-        await event.respond("👋 Admin Menu:", buttons=buttons)
+        await event.respond("👑 Admin Panel:", buttons=btns)
     else:
-        if str(user_id) not in config:
-            config[str(user_id)] = {"source": None, "targets": []}
-            save_config(config)
-        buttons = [
+        btns = [
             [Button.inline("📡 Set Source", b"user_set_source")],
             [Button.inline("➕ Add Target", b"user_add_target")],
+            [Button.inline("❌ Remove Source", b"user_remove_source")],
+            [Button.inline("🗑 Remove Target", b"user_remove_target")],
             [Button.inline("📋 View Channels", b"user_view")],
         ]
-        await event.respond("👋 Manage your forwarding setup:", buttons=buttons)
+        await event.respond("👋 Forward Setup:", buttons=btns)
 
 # -----------------------------
-# BUTTON HANDLER
+# BUTTONS
 # -----------------------------
 @client.on(events.CallbackQuery)
-async def callback_handler(event):
-    user_id = event.sender_id
-    data = event.data.decode("utf-8")
-    config = load_config()
-    user_conf = config.get(str(user_id), {"source": None, "targets": []})
+async def callback(event):
+    uid = event.sender_id
+    data = event.data.decode()
+    cfg = load_config()
+    user = cfg.get(str(uid), {"source": None, "targets": []})
 
-    if user_id == ADMIN_ID and data == "stats":
-        await event.respond(f"📊 Total users: {len(config)}")
+    if uid == ADMIN_ID and data == "stats":
+        await event.respond(f"📊 Total users: {len(cfg)}")
         return
-    elif user_id == ADMIN_ID and data == "broadcast":
+    if uid == ADMIN_ID and data == "broadcast":
         client._broadcasting = True
-        await event.respond("📢 Send your broadcast message now.")
+        await event.respond("📢 Send broadcast:")
         return
 
-    if data in ["set_source", "user_set_source"]:
-        await event.respond("📡 Send the @username or channel ID of your source.")
-        client._awaiting_source = user_id
-    elif data in ["add_target", "user_add_target"]:
-        await event.respond("➕ Send the @username or channel ID to add as target.")
-        client._awaiting_add = user_id
-    elif data in ["view", "user_view"]:
-        await event.respond(f"📋 Your setup:\n• Source: {user_conf.get('source')}\n• Targets: {user_conf.get('targets', [])}")
+    if data in ["set_source","user_set_source"]:
+        client._awaiting_source = uid
+        await event.respond("📡 Input source channel (@ or ID)")
+        return
+
+    if data in ["add_target","user_add_target"]:
+        client._awaiting_add = uid
+        await event.respond("➕ Send target channel (@ or ID)")
+        return
+
+    if data in ["remove_source","user_remove_source"]:
+        src = user.get("source")
+        if not src: return await event.respond("⚠️ No source")
+        btn = [
+            [Button.inline(f"✅ Remove {src}", b"confirm_remove_source")],
+            [Button.inline("❌ Cancel", b"cancel")]
+        ]
+        await event.respond(f"Remove {src}?", buttons=btn)
+        return
+
+    if data == "confirm_remove_source":
+        user["source"] = None
+        cfg[str(uid)] = user
+        save_config(cfg)
+        return await event.respond("✅ Source removed")
+
+    if data == "remove_target" or data=="user_remove_target":
+        tg = user.get("targets", [])
+        if not tg: return await event.respond("⚠️ No targets")
+        btn = [[Button.inline(f"❌ {t}", f"del:{t}")] for t in tg]
+        btn.append([Button.inline("Cancel", b"cancel")])
+        return await event.respond("Remove which?", buttons=btn)
+
+    if data.startswith("del:"):
+        t = data[4:]
+        tg = user.get("targets", [])
+        if t in tg: tg.remove(t)
+        user["targets"] = tg
+        cfg[str(uid)] = user
+        save_config(cfg)
+        return await event.respond(f"✅ Removed {t}")
+
+    if data in ["view","user_view"]:
+        return await event.respond(f"📋 Source: {user.get('source')}\n🎯 Targets: {user.get('targets')}")
 
 # -----------------------------
-# TEXT HANDLER
+# TEXT HANDLER (DM ONLY)
 # -----------------------------
-@client.on(events.NewMessage)
-async def text_handler(event):
-    user_id = event.sender_id
-    message = event.raw_text.strip()
-    config = load_config()
-    user_conf = config.get(str(user_id), {"source": None, "targets": []})
+@client.on(events.NewMessage(incoming=True))
+async def text(event):
+    if not event.is_private: return
 
-    # Broadcast
-    if getattr(client, "_broadcasting", False) and user_id == ADMIN_ID:
-        for uid in config.keys():
-            try:
-                await client.send_message(int(uid), message)
-            except:
-                pass
+    uid = event.sender_id
+    msg = event.raw_text.strip()
+    cfg = load_config()
+    user = cfg.get(str(uid), {"source": None, "targets": []})
+
+    if getattr(client, "_broadcasting", False) and uid == ADMIN_ID:
+        for u in cfg.keys():
+            try: await client.send_message(int(u), msg)
+            except: pass
         client._broadcasting = False
-        await event.respond("✅ Broadcast sent to all users.")
-        return
+        return await event.respond("✅ Sent")
 
-    # Source setup
-    if getattr(client, "_awaiting_source", None) == user_id:
-        user_conf["source"] = message
-        await event.respond(f"✅ Source set: {message}")
+    if getattr(client, "_awaiting_source", None) == uid:
+        user["source"] = msg
         client._awaiting_source = None
+        cfg[str(uid)] = user
+        save_config(cfg)
+        return await event.respond(f"✅ Source set: {msg}")
 
-    # Add target
-    elif getattr(client, "_awaiting_add", None) == user_id:
-        targets = user_conf.get("targets", [])
-        if message not in targets:
-            targets.append(message)
-        user_conf["targets"] = targets
-        await event.respond(f"✅ Added target: {message}")
+    if getattr(client, "_awaiting_add", None) == uid:
+        tg = user.get("targets", [])
+        if msg not in tg: tg.append(msg)
+        user["targets"] = tg
         client._awaiting_add = None
-
-    config[str(user_id)] = user_conf
-    save_config(config)
+        cfg[str(uid)] = user
+        save_config(cfg)
+        return await event.respond(f"✅ Target added: {msg}")
 
 # -----------------------------
-# KEEP-ALIVE WEB SERVER (for Render)
+# KEEP ALIVE (RENDER)
 # -----------------------------
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "✅ Telethon Forward Bot is running!"
+    return "✅ Redis Forward Bot Running"
 
 def run_web():
     port = int(os.environ.get("PORT", 10000))
-    print(f"🌐 Starting web server on port {port}")
     app.run(host="0.0.0.0", port=port)
 
 # -----------------------------
-# MAIN ENTRY
+# START BOT
 # -----------------------------
 async def main():
     await client.start(bot_token=BOT_TOKEN)
-    print("✅ Forward bot running...")
+    print("✅ Bot Live (Redis Mode)")
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
-    # Start Flask first
     threading.Thread(target=run_web, daemon=True).start()
-    import time
-    time.sleep(1)  # ensure web server is ready
-
-    # Start Telegram bot
     asyncio.run(main())
